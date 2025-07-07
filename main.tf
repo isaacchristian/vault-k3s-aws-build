@@ -1,0 +1,85 @@
+resource "random_string" "vault_pass" {
+  length  = 12
+  special = false
+}
+
+#Create AWS Public key pair
+resource "aws_key_pair" "vault_key" {
+  key_name   = "vault-key"
+  public_key = var.public_key
+}
+
+#Create VPC and subnets for EC2 instances
+module "vault-demo-vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.1.1"
+
+  name = "vault-demo-vpc"
+  cidr = "10.1.0.0/16"
+
+  azs             = slice(data.aws_availability_zones.available.names, 0, 2)
+  private_subnets = ["10.1.1.0/24", "10.1.2.0/24"]
+  public_subnets  = ["10.1.11.0/24", "10.1.12.0/24"]
+
+  enable_nat_gateway   = true
+  enable_vpn_gateway   = false
+  enable_dns_hostnames = true
+}
+
+#Create Security Group for Vault instance
+module "vault-security-group" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "5.1.0"
+
+  name        = "vault-server-access"
+  description = "Allow connection to Vault API"
+  vpc_id      = module.vault-demo-vpc.vpc_id
+
+  ingress_cidr_blocks = ["0.0.0.0/0"]
+  ingress_rules       = ["http-80-tcp", "ssh-tcp"]
+
+  ingress_with_cidr_blocks = [
+    {
+      from_port   = 8200
+      to_port     = 8200
+      protocol    = "tcp"
+      description = "Connect to Vault UI/API"
+      cidr_blocks = "0.0.0.0/0"
+    },
+    {
+      from_port   = 1389
+      to_port     = 1389
+      protocol    = "tcp"
+      description = "LDAP port"
+      cidr_blocks = "0.0.0.0/0"
+    }
+  ]
+
+  egress_with_cidr_blocks = [
+    {
+      rule        = "all-all"
+      description = "Allow egress to everything within VPC"
+      cidr_blocks = module.vault-demo-vpc.vpc_cidr_block
+    }
+  ]
+
+  egress_cidr_blocks = ["0.0.0.0/0"]
+  egress_rules       = ["https-443-tcp", "http-80-tcp"]
+}
+
+
+#Create Vault server EC2 instance with AWS Linux AMI
+resource "aws_instance" "vault-server" {
+  ami           = data.aws_ami.aws_linux_hvm2.id
+  instance_type = "t3.micro"
+
+  key_name                    = aws_key_pair.vault_key.key_name
+  monitoring                  = true
+  subnet_id                   = module.vault-demo-vpc.public_subnets[0]
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [module.vault-security-group.security_group_id]
+  user_data                   = templatefile("${path.module}/vault_user_data.tftpl", { vaultpass = random_string.vault_pass.id })
+  tags = {
+    Name = "vault-demo"
+  }
+}
